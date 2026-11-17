@@ -245,8 +245,8 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	// Only a file that passed every check reaches the disk. It goes to a
 	// temporary name first, and replaces body only once the sheet has
 	// claimed the upload, so a rejected or losing upload leaves nothing.
-	path := board.BrochurePath(s.dataDir, user.ID, job.ID)
-	tmp, err := writeTemp(filepath.Dir(path), data)
+	dest := board.BrochurePath(s.dataDir, user.ID, job.ID)
+	tmp, err := writeTemp(filepath.Dir(dest), data)
 	if err != nil {
 		log.Printf("upload %s: %v", job.ID, err)
 		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
@@ -266,7 +266,7 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := os.Rename(tmp, dest); err != nil {
 		// The sheet now names a brochure that is not on disk. The worker
 		// reports that as "Brochure is missing", so the failure stays visible.
 		_ = os.Remove(tmp)
