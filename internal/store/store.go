@@ -156,9 +156,30 @@ func (s *Store) UpdateJob(ctx context.Context, job board.Job) error {
 	return nil
 }
 
-const jobSelect = `
-	SELECT id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at
-	FROM jobs`
+func (s *Store) AttachFile(ctx context.Context, userID, id, filename string, at time.Time) (board.Job, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE jobs SET filename = $3, updated_at = $4
+		WHERE id = $1 AND user_id = $2 AND filename = ''
+		RETURNING `+jobColumns, id, userID, filename, at.UTC())
+	job, err := scanJob(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return board.Job{}, s.whyNotUpdated(ctx, userID, id)
+	}
+	return job, err
+}
+
+// whyNotUpdated tells a missing (or foreign) sheet apart from one a
+// conditional UPDATE skipped because it was in another state.
+func (s *Store) whyNotUpdated(ctx context.Context, userID, id string) error {
+	if _, err := s.Job(ctx, userID, id); err != nil {
+		return err
+	}
+	return board.ErrConflict
+}
+
+const jobColumns = `id, user_id, title, address, status, error, run_id, filename, checklist, created_at, updated_at`
+
+const jobSelect = `SELECT ` + jobColumns + ` FROM jobs`
 
 type scanner interface {
 	Scan(dest ...any) error

@@ -11,6 +11,9 @@ import (
 var (
 	ErrNotFound  = errors.New("not found")
 	ErrDuplicate = errors.New("duplicate")
+	// ErrConflict means a conditional write found the sheet in another state,
+	// for example a brochure already attached.
+	ErrConflict = errors.New("conflict")
 )
 
 type User struct {
@@ -75,4 +78,8 @@ type Store interface {
 	// is ErrNotFound, the same as a missing one, so callers can't tell them apart.
 	Job(ctx context.Context, userID, id string) (Job, error)
 	UpdateJob(ctx context.Context, job Job) error
+	// AttachFile records the brochure's original filename, only while the
+	// sheet has none, and returns the updated sheet. A sheet that already
+	// has one is ErrConflict, so two concurrent uploads can't both win.
+	AttachFile(ctx context.Context, userID, id, filename string, at time.Time) (Job, error)
 }

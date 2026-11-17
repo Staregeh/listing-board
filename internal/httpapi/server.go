@@ -1,13 +1,16 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -221,47 +224,138 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		writeErr(w, http.StatusBadRequest, "Brochure upload was incomplete")
+	if job.Filename != "" {
+		writeErr(w, http.StatusBadRequest, msgAlreadyAttached)
 		return
 	}
-	file, header, err := r.FormFile("file")
+
+	// The body limit leaves room for the multipart framing around the file;
+	// the file itself is held to MaxBrochureSize when it is read below.
+	r.Body = http.MaxBytesReader(w, r.Body, board.MaxBrochureSize+multipartSlack)
+	name, data, status, msg := readBrochure(r)
+	if msg != "" {
+		writeErr(w, status, msg)
+		return
+	}
+	if _, ok := board.ClassifyBrochure(data); !ok {
+		writeErr(w, http.StatusBadRequest, "Brochure must be a PDF or a UTF-8 text file")
+		return
+	}
+
+	// Only a file that passed every check reaches the disk. It goes to a
+	// temporary name first, and replaces body only once the sheet has
+	// claimed the upload, so a rejected or losing upload leaves nothing.
+	path := board.BrochurePath(s.dataDir, user.ID, job.ID)
+	tmp, err := writeTemp(filepath.Dir(path), data)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "Choose a brochure file")
+		log.Printf("upload %s: %v", job.ID, err)
+		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
-	defer file.Close()
-	name := filenameFromHeader(header)
-	if strings.TrimSpace(name) == "" || !headerAllows(name, header.Header.Get("Content-Type")) {
-		writeErr(w, http.StatusBadRequest, "Brochure must be a PDF or a text file")
-		return
-	}
-	data, err := io.ReadAll(io.LimitReader(file, 8<<20+1))
+	attached, err := s.store.AttachFile(r.Context(), user.ID, job.ID, name, time.Now().UTC())
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "Brochure upload was incomplete")
+		_ = os.Remove(tmp)
+		switch {
+		case errors.Is(err, board.ErrConflict):
+			writeErr(w, http.StatusBadRequest, msgAlreadyAttached)
+		case errors.Is(err, board.ErrNotFound):
+			writeErr(w, http.StatusNotFound, "Not found")
+		default:
+			log.Printf("upload %s: %v", job.ID, err)
+			writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
+		}
 		return
 	}
-	if len(data) > 8<<20 {
-		writeErr(w, http.StatusBadRequest, "Brochure is too large")
+	if err := os.Rename(tmp, path); err != nil {
+		// The sheet now names a brochure that is not on disk. The worker
+		// reports that as "Brochure is missing", so the failure stays visible.
+		_ = os.Remove(tmp)
+		log.Printf("upload %s: %v", job.ID, err)
+		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
 		return
 	}
-	dir := filepath.Join(s.dataDir, job.ID)
+	writeJSON(w, http.StatusOK, attached)
+}
+
+const (
+	msgAlreadyAttached = "This sheet already has a brochure"
+	msgTooLarge        = "Brochure must be 1 MiB or smaller"
+	// multipartSlack is how far the whole request may exceed the file limit:
+	// enough for boundaries, part headers and a long filename.
+	multipartSlack = 64 << 10
+)
+
+// readBrochure streams the multipart body to the "file" part and reads at
+// most one byte past the size limit, so an oversized file is rejected
+// without being buffered or written anywhere. It returns the client's
+// original filename exactly as sent; the caller must never use it as a path.
+func readBrochure(r *http.Request) (name string, data []byte, status int, msg string) {
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return "", nil, http.StatusBadRequest, "Send the brochure as multipart form field file"
+	}
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			return "", nil, http.StatusBadRequest, "Choose a brochure file"
+		}
+		if err != nil {
+			return "", nil, http.StatusBadRequest, uploadReadError(err)
+		}
+		if part.FormName() != "file" {
+			_ = part.Close()
+			continue
+		}
+		name := originalFilename(part)
+		if strings.TrimSpace(name) == "" {
+			return "", nil, http.StatusBadRequest, "Choose a brochure file"
+		}
+		data, err := io.ReadAll(io.LimitReader(part, board.MaxBrochureSize+1))
+		if err != nil {
+			return "", nil, http.StatusBadRequest, uploadReadError(err)
+		}
+		if len(data) > board.MaxBrochureSize {
+			return "", nil, http.StatusBadRequest, msgTooLarge
+		}
+		return name, data, 0, ""
+	}
+}
+
+func uploadReadError(err error) string {
+	var tooBig *http.MaxBytesError
+	if errors.As(err, &tooBig) {
+		return msgTooLarge
+	}
+	return "Brochure upload was incomplete"
+}
+
+// originalFilename returns the filename parameter exactly as the client sent
+// it. multipart.Part.FileName would strip directories, but the sheet keeps
+// the original name, and safety comes from never using it as a path.
+func originalFilename(part *multipart.Part) string {
+	_, params, err := mime.ParseMediaType(part.Header.Get("Content-Disposition"))
+	if err != nil {
+		return ""
+	}
+	return params["filename"]
+}
+
+// writeTemp writes data to a new temporary file in dir and returns its path.
+func writeTemp(dir string, data []byte) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
-		return
+		return "", err
 	}
-	dst := filepath.Join(dir, name)
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
-		return
+	f, err := os.CreateTemp(dir, "body.tmp-*")
+	if err != nil {
+		return "", err
 	}
-	job.Filename = name
-	job.UpdatedAt = time.Now().UTC()
-	if err := s.store.UpdateJob(r.Context(), job); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not store the brochure")
-		return
+	_, werr := f.Write(data)
+	cerr := f.Close()
+	if werr != nil || cerr != nil {
+		_ = os.Remove(f.Name())
+		return "", errors.Join(werr, cerr)
 	}
-	writeJSON(w, http.StatusOK, job)
+	return f.Name(), nil
 }
 
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
@@ -304,14 +398,31 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
-	f, err := os.Open(filepath.Join(s.dataDir, job.ID, job.Filename))
+	// Brochures are at most 1 MiB, so reading one whole is cheap, and the
+	// type is decided from the stored bytes, the same way the upload was.
+	data, err := os.ReadFile(board.BrochurePath(s.dataDir, user.ID, job.ID))
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return
 	}
-	defer f.Close()
-	w.Header().Set("Content-Disposition", "attachment; filename="+strconvQuote(filepath.Base(job.Filename)))
-	http.ServeContent(w, r, filepath.Base(job.Filename), job.UpdatedAt, f)
+	contentType, ok := board.ClassifyBrochure(data)
+	if !ok {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", attachment(job.Filename))
+	http.ServeContent(w, r, "", job.UpdatedAt, bytes.NewReader(data))
+}
+
+// attachment builds a Content-Disposition header for the original filename,
+// minus any directories, encoded so quotes or non-ASCII can't break it.
+func attachment(filename string) string {
+	name := path.Base(strings.ReplaceAll(filename, `\`, "/"))
+	if v := mime.FormatMediaType("attachment", map[string]string{"filename": name}); v != "" {
+		return v
+	}
+	return "attachment"
 }
 
 // load fetches the sheet named in the path for the signed-in user and writes
@@ -359,25 +470,6 @@ func (s *Server) openSession(w http.ResponseWriter, r *http.Request, user board.
 	return nil
 }
 
-func filenameFromHeader(header *multipart.FileHeader) string {
-	_, params, err := mime.ParseMediaType(header.Header.Get("Content-Disposition"))
-	if err == nil {
-		if name := strings.TrimSpace(params["filename"]); name != "" {
-			return name
-		}
-	}
-	return header.Filename
-}
-
-func headerAllows(name, contentType string) bool {
-	ct := strings.ToLower(contentType)
-	lower := strings.ToLower(name)
-	if strings.Contains(ct, "pdf") || strings.Contains(ct, "text/plain") {
-		return true
-	}
-	return strings.HasSuffix(lower, ".pdf") || strings.HasSuffix(lower, ".txt")
-}
-
 func decode(w http.ResponseWriter, r *http.Request, dst any) error {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	return dec.Decode(dst)
@@ -391,11 +483,6 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeErr(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
-}
-
-func strconvQuote(value string) string {
-	b, _ := json.Marshal(value)
-	return string(b)
 }
 
 func withCORS(next http.Handler) http.Handler {
