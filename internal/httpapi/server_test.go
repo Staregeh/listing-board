@@ -77,6 +77,47 @@ func TestListHidesOtherUsersJobs(t *testing.T) {
 	}
 }
 
+// Every route that takes an id answers 404 for someone else's sheet, the
+// same as for an unknown one, so ids can't be probed. Nothing the other
+// account sends may change the sheet either.
+func TestSheetRoutesHideOtherUsersSheets(t *testing.T) {
+	srv, _ := newTestServer(t)
+	ada := signUp(t, srv, "ada@example.com")
+	grace := signUp(t, srv, "grace@example.com")
+	job := createSheet(t, srv, ada, "Market loft", "10 Market Street")
+	uploadFile(t, srv, ada, job.ID, "brochure.pdf", []byte("%PDF-1.4\n"), "application/pdf")
+
+	for _, id := range []string{job.ID, board.NewID()} {
+		upload, contentType := multipartBody(t, "other.txt", []byte("not yours"), "text/plain")
+		routes := []struct {
+			method, path string
+			body         io.Reader
+			contentType  string
+		}{
+			{http.MethodGet, "/api/jobs/" + id, nil, ""},
+			{http.MethodPost, "/api/jobs/" + id + "/file", upload, contentType},
+			{http.MethodPost, "/api/jobs/" + id + "/start", nil, ""},
+			{http.MethodGet, "/api/jobs/" + id + "/file", nil, ""},
+		}
+		for _, route := range routes {
+			res := call(srv, route.method, route.path, grace, route.body, route.contentType)
+			if res.Code != http.StatusNotFound {
+				t.Errorf("%s %s as another account: status %d, want 404: %s", route.method, route.path, res.Code, res.Body.String())
+			}
+			assertJSONError(t, res)
+		}
+	}
+
+	res := call(srv, http.MethodGet, "/api/jobs/"+job.ID, ada, nil, "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("owner read: status %d: %s", res.Code, res.Body.String())
+	}
+	got := decodeJob(t, res)
+	if got.Status != "draft" || got.RunID != "" || got.Filename != "brochure.pdf" {
+		t.Fatalf("another account changed the sheet: status %q, runId %q, filename %q", got.Status, got.RunID, got.Filename)
+	}
+}
+
 func TestStartRequiresASession(t *testing.T) {
 	srv, _ := newTestServer(t)
 	res := call(srv, http.MethodPost, "/api/jobs/"+board.NewID()+"/start", "", nil, "")
@@ -119,6 +160,18 @@ func createSheet(t *testing.T, srv *Server, cookie, title, address string) board
 
 func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte, contentType string) {
 	t.Helper()
+	body, formType := multipartBody(t, name, data, contentType)
+	res := call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, body, formType)
+	if res.Code != http.StatusOK {
+		t.Fatalf("upload %d: %s", res.Code, res.Body.String())
+	}
+}
+
+// multipartBody builds a form with one "file" part. The filename goes into
+// the header as given, without the escaping mime/multipart would apply, so
+// tests can send names like ../../escaped.txt exactly as a hostile client would.
+func multipartBody(t *testing.T, name string, data []byte, contentType string) (io.Reader, string) {
+	t.Helper()
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 	header := textproto.MIMEHeader{}
@@ -134,9 +187,17 @@ func uploadFile(t *testing.T, srv *Server, cookie, id, name string, data []byte,
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	res := call(srv, http.MethodPost, "/api/jobs/"+id+"/file", cookie, &buf, writer.FormDataContentType())
-	if res.Code != http.StatusOK {
-		t.Fatalf("upload %d: %s", res.Code, res.Body.String())
+	return &buf, writer.FormDataContentType()
+}
+
+// assertJSONError checks the error body has the documented {"error": "..."} shape.
+func assertJSONError(t *testing.T, res *httptest.ResponseRecorder) {
+	t.Helper()
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(res.Body.Bytes(), &body); err != nil || body.Error == "" {
+		t.Errorf("error body is not {\"error\": \"...\"}: %q", res.Body.String())
 	}
 }
 
@@ -256,11 +317,11 @@ func (m *mem) CreateJob(_ context.Context, job board.Job) error {
 	return nil
 }
 
-func (m *mem) Job(_ context.Context, id string) (board.Job, error) {
+func (m *mem) Job(_ context.Context, userID, id string) (board.Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	job, ok := m.jobs[id]
-	if !ok {
+	if !ok || job.UserID != userID {
 		return board.Job{}, board.ErrNotFound
 	}
 	return cloneJob(job), nil

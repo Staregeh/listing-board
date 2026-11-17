@@ -201,10 +201,11 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
@@ -212,10 +213,11 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
@@ -263,10 +265,11 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
@@ -289,10 +292,11 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.current(w, r); !ok {
+	user, ok := s.current(w, r)
+	if !ok {
 		return
 	}
-	job, ok := s.load(w, r)
+	job, ok := s.load(w, r, user)
 	if !ok {
 		return
 	}
@@ -310,8 +314,10 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, filepath.Base(job.Filename), job.UpdatedAt, f)
 }
 
-func (s *Server) load(w http.ResponseWriter, r *http.Request) (board.Job, bool) {
-	job, err := s.store.Job(r.Context(), r.PathValue("id"))
+// load fetches the sheet named in the path for the signed-in user and writes
+// 404 when it is missing or belongs to someone else.
+func (s *Server) load(w http.ResponseWriter, r *http.Request, user board.User) (board.Job, bool) {
+	job, err := s.store.Job(r.Context(), user.ID, r.PathValue("id"))
 	if errors.Is(err, board.ErrNotFound) {
 		writeErr(w, http.StatusNotFound, "Not found")
 		return board.Job{}, false

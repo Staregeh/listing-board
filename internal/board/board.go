@@ -71,6 +71,8 @@ type Store interface {
 	UserByToken(ctx context.Context, token string) (User, error)
 	ListJobs(ctx context.Context, userID string) ([]Job, error)
 	CreateJob(ctx context.Context, job Job) error
-	Job(ctx context.Context, id string) (Job, error)
+	// Job returns the sheet only when userID owns it. Someone else's sheet
+	// is ErrNotFound, the same as a missing one, so callers can't tell them apart.
+	Job(ctx context.Context, userID, id string) (Job, error)
 	UpdateJob(ctx context.Context, job Job) error
 }
