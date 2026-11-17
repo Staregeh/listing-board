@@ -91,6 +91,7 @@ button.row.on {
   padding: 0;
   display: grid;
   gap: 8px;
+  align-content: start;
 }
 
 .sheet {
@@ -115,6 +116,62 @@ li.done {
 
 .status.success {
   color: #3d6b45;
+}
+
+.status.running {
+  color: #8a5a12;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.checklist {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.checklist li::before {
+  content: "○";
+  display: inline-block;
+  width: 1.4em;
+  color: #6d675e;
+}
+
+.checklist li.done {
+  color: #3d6b45;
+}
+
+.checklist li.done::before {
+  content: "●";
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.attach {
+  margin: 12px 0;
+}
+
+.run {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .status.failed, .error {
