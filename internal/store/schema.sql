@@ -24,3 +24,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
+
+-- At most one running sheet per account. POST /start relies on this to
+-- answer 409 even when two starts race; the worker uses it to find work.
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_running_per_user
+    ON jobs (user_id) WHERE status = 'running';

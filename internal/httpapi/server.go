@@ -191,7 +191,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		UserID:    user.ID,
 		Title:     title,
 		Address:   address,
-		Status:    "draft",
+		Status:    board.StatusDraft,
 		Checklist: board.NewChecklist(),
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -367,22 +367,50 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if strings.TrimSpace(job.Filename) == "" {
-		writeErr(w, http.StatusBadRequest, "Attach a brochure first")
-		return
+	// The handler only moves a draft to running. Steps, success and failure
+	// belong to the worker. If a concurrent start changes the sheet between
+	// the read and the write, decide again from the fresh copy: that is how
+	// two starts of one sheet both get 200 with the same runId.
+	for attempt := 0; attempt < 2; attempt++ {
+		switch job.Status {
+		case board.StatusRunning:
+			writeJSON(w, http.StatusOK, job)
+			return
+		case board.StatusDraft:
+			// Checked before the running-sheet conflict: what this sheet
+			// itself is missing is the more useful answer.
+			if job.Filename == "" {
+				writeErr(w, http.StatusBadRequest, "Attach a brochure first")
+				return
+			}
+		default:
+			writeErr(w, http.StatusConflict, "This sheet has already finished")
+			return
+		}
+
+		started, err := s.store.StartJob(r.Context(), user.ID, job.ID, board.NewID(), time.Now().UTC())
+		switch {
+		case err == nil:
+			writeJSON(w, http.StatusOK, started)
+			return
+		case errors.Is(err, board.ErrBusy):
+			writeErr(w, http.StatusConflict, "Another sheet is already running")
+			return
+		case errors.Is(err, board.ErrConflict):
+			if job, ok = s.load(w, r, user); !ok {
+				return
+			}
+			continue
+		case errors.Is(err, board.ErrNotFound):
+			writeErr(w, http.StatusNotFound, "Not found")
+			return
+		default:
+			log.Printf("start %s: %v", job.ID, err)
+			writeErr(w, http.StatusInternalServerError, "Could not start the sheet")
+			return
+		}
 	}
-	job.Status = "success"
-	job.RunID = board.NewID()
-	job.Error = ""
-	for i := range job.Checklist {
-		job.Checklist[i].State = "done"
-	}
-	job.UpdatedAt = time.Now().UTC()
-	if err := s.store.UpdateJob(r.Context(), job); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not start the sheet")
-		return
-	}
-	writeJSON(w, http.StatusOK, job)
+	writeErr(w, http.StatusConflict, "The sheet changed while starting; try again")
 }
 
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {

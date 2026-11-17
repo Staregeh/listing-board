@@ -14,6 +14,23 @@ var (
 	// ErrConflict means a conditional write found the sheet in another state,
 	// for example a brochure already attached.
 	ErrConflict = errors.New("conflict")
+	// ErrBusy means the account already has a different sheet running.
+	ErrBusy = errors.New("another sheet is running")
+)
+
+// Sheet statuses. A sheet moves draft → running → success or failed, and
+// never leaves success or failed.
+const (
+	StatusDraft   = "draft"
+	StatusRunning = "running"
+	StatusSuccess = "success"
+	StatusFailed  = "failed"
+)
+
+// Checklist step states.
+const (
+	StepPending = "pending"
+	StepDone    = "done"
 )
 
 type User struct {
@@ -43,9 +60,9 @@ type Job struct {
 
 func NewChecklist() []Step {
 	return []Step{
-		{Label: "Reading the brochure", State: "pending"},
-		{Label: "Checking the address", State: "pending"},
-		{Label: "Publishing the sheet", State: "pending"},
+		{Label: "Reading the brochure", State: StepPending},
+		{Label: "Checking the address", State: StepPending},
+		{Label: "Publishing the sheet", State: StepPending},
 	}
 }
 
@@ -77,7 +94,12 @@ type Store interface {
 	// Job returns the sheet only when userID owns it. Someone else's sheet
 	// is ErrNotFound, the same as a missing one, so callers can't tell them apart.
 	Job(ctx context.Context, userID, id string) (Job, error)
-	UpdateJob(ctx context.Context, job Job) error
+	// StartJob moves a draft that has a brochure to running with the given
+	// runID, as one conditional write, and returns the updated sheet. It is
+	// ErrBusy when the account already has another sheet running, and
+	// ErrConflict when the sheet is no longer a draft with a brochure (for
+	// example a concurrent start got there first).
+	StartJob(ctx context.Context, userID, id, runID string, at time.Time) (Job, error)
 	// AttachFile records the brochure's original filename, only while the
 	// sheet has none, and returns the updated sheet. A sheet that already
 	// has one is ErrConflict, so two concurrent uploads can't both win.

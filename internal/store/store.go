@@ -133,27 +133,22 @@ func (s *Store) Job(ctx context.Context, userID, id string) (board.Job, error) {
 	return job, mapNotFound(err)
 }
 
-func (s *Store) UpdateJob(ctx context.Context, job board.Job) error {
-	raw, err := json.Marshal(job.Checklist)
-	if err != nil {
-		return err
+// StartJob relies on the jobs_one_running_per_user index: when the account
+// already has a running sheet the UPDATE violates it, so two concurrent
+// starts can never both succeed.
+func (s *Store) StartJob(ctx context.Context, userID, id, runID string, at time.Time) (board.Job, error) {
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE jobs SET status = 'running', run_id = $3, updated_at = $4
+		WHERE id = $1 AND user_id = $2 AND status = 'draft' AND filename <> ''
+		RETURNING `+jobColumns, id, userID, runID, at.UTC())
+	job, err := scanJob(row)
+	switch {
+	case isUnique(err):
+		return board.Job{}, board.ErrBusy
+	case errors.Is(err, sql.ErrNoRows):
+		return board.Job{}, s.whyNotUpdated(ctx, userID, id)
 	}
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE jobs
-		SET status = $1, error = $2, run_id = $3, filename = $4, checklist = $5, updated_at = $6
-		WHERE id = $7
-	`, job.Status, job.Error, job.RunID, job.Filename, string(raw), job.UpdatedAt.UTC(), job.ID)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return board.ErrNotFound
-	}
-	return nil
+	return job, err
 }
 
 func (s *Store) AttachFile(ctx context.Context, userID, id, filename string, at time.Time) (board.Job, error) {
