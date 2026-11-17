@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -37,15 +39,51 @@ func Open(dsn string) (*Store, error) {
 	return s, nil
 }
 
+// OpenWithRetry keeps calling Open until it succeeds or at least wait has
+// passed, so a process that starts before Postgres is ready still comes up.
+func OpenWithRetry(ctx context.Context, dsn string, wait time.Duration) (*Store, error) {
+	deadline := time.Now().Add(wait)
+	for attempt := 1; ; attempt++ {
+		st, err := Open(dsn)
+		if err == nil {
+			return st, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("database not ready after %d attempts: %w", attempt, err)
+		}
+		log.Printf("database not ready (attempt %d): %v", attempt, err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
 func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// migrateLockID names the advisory lock that serialises migrations. The API
+// and the worker both migrate on startup, and concurrent CREATE ... IF NOT
+// EXISTS statements can still collide in Postgres.
+const migrateLockID = 7_340_112
+
 func (s *Store) migrate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := s.db.ExecContext(ctx, schemaSQL)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, migrateLockID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, schemaSQL); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) CreateUser(ctx context.Context, email, passwordHash string) (board.User, error) {
@@ -161,6 +199,55 @@ func (s *Store) AttachFile(ctx context.Context, userID, id, filename string, at 
 		return board.Job{}, s.whyNotUpdated(ctx, userID, id)
 	}
 	return job, err
+}
+
+// RunningJobs lists every running sheet, oldest change first, for the worker.
+func (s *Store) RunningJobs(ctx context.Context) ([]board.Job, error) {
+	rows, err := s.db.QueryContext(ctx, jobSelect+` WHERE status = 'running' ORDER BY updated_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var jobs []board.Job
+	for rows.Next() {
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, rows.Err()
+}
+
+// SaveProgress writes to's status, error and checklist, but only while the
+// sheet is still exactly as from left it: running, with the same runId and
+// the same checklist. Otherwise nothing is written and it returns
+// ErrConflict, so a step can never be applied twice, not even by two
+// workers racing on one sheet.
+func (s *Store) SaveProgress(ctx context.Context, from, to board.Job, at time.Time) error {
+	before, err := json.Marshal(from.Checklist)
+	if err != nil {
+		return err
+	}
+	after, err := json.Marshal(to.Checklist)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE jobs SET status = $4, error = $5, checklist = $6, updated_at = $7
+		WHERE id = $1 AND run_id = $2 AND checklist = $3 AND status = 'running'
+	`, from.ID, from.RunID, string(before), to.Status, to.Error, string(after), at.UTC())
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return board.ErrConflict
+	}
+	return nil
 }
 
 // whyNotUpdated tells a missing (or foreign) sheet apart from one a
