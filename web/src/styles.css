@@ -73,6 +73,10 @@ button.ghost, button.row {
   color: inherit;
 }
 
+form + button.ghost {
+  margin-top: 12px;
+}
+
 button.row {
   width: 100%;
   display: flex;
